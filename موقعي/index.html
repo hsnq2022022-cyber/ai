@@ -1,0 +1,443 @@
+<!DOCTYPE html>
+<html lang="ar" dir="rtl">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>إدارة ســوشـــيــــال — منصة موظفي الذكاء الاصطناعي</title>
+<link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/@fontsource/cairo@5.0.0/400.css">
+<link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/@fontsource/cairo@5.0.0/700.css">
+<link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/@fontsource/cairo@5.0.0/800.css">
+<link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/@fontsource/ibm-plex-sans-arabic@5.0.0/400.css">
+<link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/@fontsource/ibm-plex-sans-arabic@5.0.0/700.css">
+<script src="https://cdn.tailwindcss.com"></script>
+<script src="https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2/dist/umd/supabase.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/pdfjs-dist@3.11.174/build/pdf.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/mammoth@1.6.0/mammoth.browser.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/xlsx@0.18.5/dist/xlsx.full.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/jszip@3.10.1/dist/jszip.min.js"></script>
+<script>
+tailwind.config={theme:{extend:{colors:{
+tiffany:{50:'#e6fbfa',100:'#c2f5f3',200:'#8aeae6',300:'#4fdcd7',400:'#22cdc8',500:'#0ABAB5',600:'#089e9a',700:'#077f7c',800:'#0a6361',900:'#0b514f'},
+ink:{50:'#f5f6f7',100:'#e8eaed',200:'#d3d7dc',300:'#aeb6bf',400:'#8a94a0',500:'#6b7684',600:'#545e6b',700:'#414a56',800:'#2b323b',850:'#22272f',900:'#1a1e24',950:'#12151a'}},
+fontFamily:{sans:['"IBM Plex Sans Arabic"','Cairo','sans-serif'],display:['Cairo','sans-serif']},
+boxShadow:{soft:'0 8px 30px rgba(0,0,0,.25)',glow:'0 0 0 1px rgba(10,186,181,.35),0 8px 30px rgba(10,186,181,.18)'}}}}
+</script>
+<link rel="stylesheet" href="css/global.css">
+<link rel="stylesheet" href="css/auth.css">
+<link rel="stylesheet" href="css/dashboard.css">
+<link rel="stylesheet" href="css/agents.css">
+<link rel="stylesheet" href="css/knowledge.css">
+<link rel="stylesheet" href="css/channels.css">
+<link rel="stylesheet" href="css/conversations.css">
+<link rel="stylesheet" href="css/contacts.css">
+<link rel="stylesheet" href="css/widgets.css">
+<link rel="stylesheet" href="css/billing.css">
+<link rel="stylesheet" href="css/settings.css">
+</head>
+<body class="antialiased">
+<div id="app"></div>
+<div id="toasts" class="fixed bottom-5 left-5 z-[999] space-y-2"></div>
+<div id="modal-root"></div>
+<!-- ====== Server delivery sources ====== -->
+<script type="text/plain" id="src-sql-ob">
+-- Onboarding: لا يلزم جدول جديد. حالة المعالج تُدار ضمن إعدادات مساحة العمل
+-- وتُحفظ تلقائيًا عبر save() مع استئناف تلقائي عند العودة.
+-- (اختياري) للمزامنة على الخادم:
+-- alter table public.workspaces add column if not exists onboarded boolean default false;
+</script>
+<script type="text/plain" id="src-secrets">
+supabase secrets set GEMINI_API_KEY=YOUR_GEMINI_API_KEY
+supabase functions deploy ai-respond    --no-verify-jwt
+supabase functions deploy verify-widget --no-verify-jwt
+supabase functions deploy kb-process    --no-verify-jwt
+supabase functions deploy kb-crawl      --no-verify-jwt
+supabase functions deploy kb-ingest     --no-verify-jwt
+</script>
+<script type="text/plain" id="src-sql2">
+create extension if not exists vector;
+create table if not exists public.knowledge_chunks (
+id uuid primary key default gen_random_uuid(),
+workspace_id uuid not null references public.workspaces(id) on delete cascade,
+doc_id text not null, content text not null, embedding vector(768),
+created_at timestamptz default now());
+create index if not exists chunks_ws_idx on public.knowledge_chunks(workspace_id);
+create index if not exists chunks_doc_idx on public.knowledge_chunks(doc_id);
+create index if not exists chunks_hnsw_idx on public.knowledge_chunks using hnsw (embedding vector_cosine_ops);
+alter table public.knowledge_chunks enable row level security;
+drop policy if exists chunks_member on public.knowledge_chunks;
+create policy chunks_member on public.knowledge_chunks for all
+using (workspace_id in (select id from public.workspaces where owner_id = auth.uid()))
+with check (workspace_id in (select id from public.workspaces where owner_id = auth.uid()));
+create or replace function public.increment_ai_usage(wsid uuid) returns void language sql security definer as $$
+update public.workspaces set usage_ai = usage_ai + 1 where id = wsid; $$;
+create or replace function public.enforce_agent_limit() returns trigger language plpgsql security definer as $$
+declare v_plan text; v_count int; v_limit int;
+begin
+select plan into v_plan from public.workspaces where id = NEW.workspace_id;
+v_limit := case when v_plan='growth' then 10 when v_plan='pro' then 999 else 8 end;
+select count(*) into v_count from public.agents where workspace_id = NEW.workspace_id;
+if v_count >= v_limit then raise exception 'AGENT_LIMIT_REACHED'; end if;
+return NEW;
+end; $$;
+drop trigger if exists trg_agent_limit on public.agents;
+create trigger trg_agent_limit before insert on public.agents for each row execute function public.enforce_agent_limit();
+insert into storage.buckets (id,name,public) values ('kb-files','kb-files',false) on conflict (id) do nothing;
+drop policy if exists kb_files_member on storage.objects;
+create policy kb_files_member on storage.objects for all
+using (bucket_id='kb-files' and (auth.uid() in (select owner_id from public.workspaces where id::text=(storage.foldername(name))[1])))
+with check (bucket_id='kb-files' and (auth.uid() in (select owner_id from public.workspaces where id::text=(storage.foldername(name))[1])));
+</script>
+<script type="text/plain" id="src-sql3">
+alter table public.knowledge_chunks add column if not exists agent_id text;
+create index if not exists chunks_agent_idx on public.knowledge_chunks(agent_id);
+-- (استُبدلت في ترحيل المرحلة 4 بالدالة الصارمة — راجع تبويب «٤. العزل الصارم والتشخيص»)
+</script>
+<script type="text/plain" id="src-sql4">
+-- إدارة ســوشـــيــــال — Phase 4: عزل صارم بين الوكلاء + أدوات تشخيص
+create or replace function public.match_kb_chunks_agent(ws uuid, ag text, q vector, match_count int default 4)
+returns table (doc_id text, content text, similarity float) language sql stable as $$
+select c.doc_id, c.content, 1 - (c.embedding <=> q) as similarity
+from public.knowledge_chunks c
+where c.workspace_id = ws and c.embedding is not null and c.agent_id = ag
+order by c.embedding <=> q limit match_count; $$;
+create or replace view public.kb_diagnostics as
+select d.id as doc_id, d.workspace_id, d.data->>'name' as name, d.data->>'type' as type,
+d.data->>'status' as status, d.data->>'agentId' as agent_id,
+(select count(*) from public.knowledge_chunks c where c.doc_id = d.id) as chunks_total,
+(select count(*) from public.knowledge_chunks c where c.doc_id = d.id and c.embedding is not null) as embeddings,
+(select count(distinct c.agent_id) from public.knowledge_chunks c where c.doc_id = d.id) as agents_linked
+from public.knowledge_docs d;
+</script>
+<script type="text/plain" id="src-verify">
+// supabase/functions/verify-widget/index.ts
+import { createClient } from "npm:@supabase/supabase-js@2";
+const CORS={"Access-Control-Allow-Origin":"*","Access-Control-Allow-Headers":"authorization, x-client-info, api-key, content-type","Access-Control-Allow-Methods":"POST, OPTIONS"};
+const json=(b,s=200)=>new Response(JSON.stringify(b),{status:s,headers:{...CORS,"Content-Type":"application/json"}});
+Deno.serve(async(req)=>{
+if(req.method==="OPTIONS")return new Response("ok",{headers:CORS});
+try{
+const {widget_id,token}=await req.json().catch(()=>({}));
+if(!widget_id||!token)return json({error:"bad_request"},400);
+const admin=createClient(Deno.env.get("SUPABASE_URL")!,Deno.env.get("SUPABASE_SERVICE_ROLE_KEY")!);
+const {data:widgetRow}=await admin.from("widgets").select("id, workspace_id, data").eq("id",String(widget_id)).maybeSingle();
+if(!widgetRow)return json({error:"invalid_widget"},403);
+const wd:any=widgetRow.data??{};
+if(typeof wd.token!=="string"||wd.token!==String(token))return json({error:"invalid_widget",message:"التوكن غير صحيح."},403);
+if(wd.enabled===false)return json({error:"disabled"},403);
+if(!wd.agentId)return json({error:"no_agent"},500);
+const {data:agentRow}=await admin.from("agents").select("data").eq("id",String(wd.agentId)).maybeSingle();
+const ad:any=agentRow?.data??{};
+const {data:wsRow}=await admin.from("workspaces").select("plan").eq("id",widgetRow.workspace_id).maybeSingle();
+return json({ok:true,widget_id,agent:{name:ad.name||"مساعدك الذكي",avatar:ad.avatar||""},settings:{
+name:wd.name||ad.name||"مساعدك الذكي",welcome:wd.welcome||ad.welcome||"أهلًا بك 👋",
+placeholder:wd.placeholder||"اكتب رسالتك...",offline:wd.offline||"نحن غير متصلين حاليًا.",
+primary:wd.primary||"#0ABAB5",secondary:wd.secondary||"#0b514f",header:wd.header||"",bg:wd.bg||"#1a1e24",
+userBg:wd.userBg||"#22272f",aiBg:wd.aiBg||"",text:wd.text||"#e8eaed",shadow:wd.shadow!==false,border:!!wd.border,
+buttonSize:typeof wd.buttonSize==="number"?wd.buttonSize:56,radius:typeof wd.radius==="number"?wd.radius:16,
+width:typeof wd.width==="number"?wd.width:360,height:typeof wd.height==="number"?wd.height:520,
+position:wd.position||"bottom-left",avatar:wd.avatar||ad.avatar||"",logo:wd.logo||"",
+online:wd.online!==false,typing:wd.typing!==false,autoOpen:!!wd.autoOpen,
+delay:typeof wd.delay==="number"?wd.delay:3,badge:wd.badge!==false,sound:!!wd.sound,
+mobile:wd.mobile==="full"?"full":"panel",credit:(wsRow?.plan||"free")==="free"}});
+}catch(err){console.error(err);return json({error:"server"},500);}
+});
+</script>
+<script type="text/plain" id="src-ai">
+// supabase/functions/ai-respond/index.ts — RAG صارم (temperature=0.1) بدون هلوسة
+import { createClient } from "npm:@supabase/supabase-js@2";
+import { GoogleGenerativeAI } from "npm:@google/generative-ai";
+const CORS={"Access-Control-Allow-Origin":"*","Access-Control-Allow-Headers":"authorization, x-client-info, api-key, content-type","Access-Control-Allow-Methods":"POST, OPTIONS"};
+const json=(b,s=200)=>new Response(JSON.stringify(b),{status:s,headers:{...CORS,"Content-Type":"application/json"}});
+const PLAN_LIMITS:Record<string,number>={free:500,growth:5000,pro:50000};
+const NO_INFO="عذراً، هذه المعلومة غير متوفرة لدي حالياً، هل أستطيع تحويلك لأحد موظفي الدعم؟";
+const HANDOFF=["موظف","انسان","بشري","شخص حقيقي","مختص","مسؤول"];
+const norm=(s:string)=>s.replace(/[\u064B-\u0652\u0640]/g,"").replace(/[أإآ]/g,"ا").replace(/ى/g,"ي").replace(/ة/g,"ه").toLowerCase();
+function classify(messages:any[],status:string){
+const t=norm(messages.filter(m=>m.from==="visitor").map(m=>String(m.text||"")).join(" "));
+let score=0;const tags:string[]=[];
+if(/(سعر|بكم|يكلف|تكلف)/.test(t)){score+=10;tags.push("سأل عن السعر");}
+if(/(توصيل|شحن|يوصل)/.test(t)){score+=15;tags.push("سأل عن التوصيل");}
+if(/(دفع|فيزا|مدي|بطاقه|كاش|تحويل بنكي)/.test(t)){score+=20;tags.push("سأل عن الدفع");}
+if(/(اريد اطلب|ابغي اطلب|ابى اطلب|اطلب الان|اشتري|اريد الشراء|احجز)/.test(t)){score+=40;tags.push("نية شراء");}
+if(/(موظف|انسان|بشري)/.test(t))tags.push("طلب موظف");
+score=Math.min(score,100);
+let cls="استفسار عام";
+if(status==="handoff")cls="يحتاج متابعة";
+else if(score>=60)cls="مشتري"; else if(score>=40)cls="عميل محتمل"; else if(score>=15)cls="مهتم";
+return {score,cls,tags};
+}
+Deno.serve(async(req)=>{
+if(req.method==="OPTIONS")return new Response("ok",{headers:CORS});
+try{
+const {widget_id,token,message,conversation_id}=await req.json().catch(()=>({}));
+if(!widget_id||!token)return json({error:"bad_request",message:"طلب غير صالح."},400);
+const text=String(message??"").trim();
+if(!text)return json({error:"empty"},400);
+if(text.length>500)return json({error:"too_long"},400);
+const admin=createClient(Deno.env.get("SUPABASE_URL")!,Deno.env.get("SUPABASE_SERVICE_ROLE_KEY")!);
+const {data:widgetRow}=await admin.from("widgets").select("*").eq("id",String(widget_id)).maybeSingle();
+const wd:any=widgetRow?.data??{};
+if(!widgetRow||typeof wd.token!=="string"||wd.token!==String(token))return json({error:"invalid_widget"},403);
+if(wd.enabled===false)return json({error:"disabled"},403);
+if(!wd.agentId)return json({error:"no_agent"},500);
+const wsId=widgetRow.workspace_id,agentId=String(wd.agentId);
+const {data:wsRow}=await admin.from("workspaces").select("*").eq("id",wsId).maybeSingle();
+if(!wsRow)return json({error:"no_workspace"},404);
+if((wsRow.usage_ai||0)>=(PLAN_LIMITS[wsRow.plan||"free"]??500))return json({error:"limit",message:"تم تجاوز الحد الشهري لرسائل الذكاء الاصطناعي. الرجاء ترقية الخطة."},429);
+const {data:agentRow}=await admin.from("agents").select("*").eq("id",agentId).maybeSingle();
+if(!agentRow)return json({error:"no_agent"},500);
+const ad:any=agentRow.data??{};
+let conv:any=null;
+if(conversation_id){const r=await admin.from("conversations").select("*").eq("id",String(conversation_id)).maybeSingle();conv=r.data||null;}
+const cd:any=conv?.data||{status:"active",messages:[],contactId:null};
+if(cd.status==="handoff"&&!HANDOFF.some(k=>norm(text).includes(norm(k))))return json({handoff_locked:true,message:"هذه المحادثة بيد فريق الدعم الآن، سيتولى موظف بشري الرد."});
+if(HANDOFF.some(k=>norm(text).includes(norm(k)))){
+cd.status="handoff";cd.messages=cd.messages||[];cd.messages.push({from:"visitor",text,at:Date.now()});cd.updatedAt=Date.now();
+if(conv)await admin.from("conversations").update({data:cd}).eq("id",conv.id);
+return json({reply:"أكيد، حولتك للموظف المختص الآن ✋ سيتابع معك خلال دقائق.",handoff:true,conversation_id:conv?.id||null});
+}
+const apiKey=Deno.env.get("GEMINI_API_KEY");
+if(!apiKey)return json({error:"server",message:"عذرًا، حصل خطأ مؤقت. حاول مرة ثانية."},500);
+const genAI=new GoogleGenerativeAI(apiKey);
+const qVec=(await genAI.getGenerativeModel({model:"text-embedding-004"}).embedContent(text)).embedding.values as number[];
+const {data:hits}=await admin.rpc("match_kb_chunks_agent",{ws:wsId,ag:agentId,q:qVec,match_count:4});
+const context=(hits||[]).filter((h:any)=>h.similarity>=0.55).map((h:any)=>h.content).join("\n---\n");
+const history=(cd.messages||[]).slice(-10).filter((m:any)=>m.from==="visitor"||m.from==="ai")
+.map((m:any)=>({role:m.from==="visitor"?"user" as const:"model" as const,parts:[{text:String(m.text)}]}));
+const sys=[ad.instructions||"أنت موظف خدمة عملاء.",
+"أنت موظف خدمة عملاء لمنصة إدارة ســوشـــيــــال. وظيفتك الوحيدة هي الإجابة بناءً على السياق المرفق فقط (Context).",
+"إذا كان السؤال خارج السياق، أو يطلب أسعاراً أو خدمات أو منتجات أو مواعيد أو سياسات أو أرقاماً غير مذكورة في السياق، قل نصاً حرفياً:",
+'"'+NO_INFO+'"',
+"يمنع منعاً باتاً اختراع أي معلومات أو الاعتماد على معرفتك العامة أو تقدير أي أرقام أو تفاصيل.",
+"كن مختصراً وطبيعياً. احترم لغة المستخدم واللهجة المحددة للـ Agent.",
+context?"المعلومات الموثقة من قاعدة المعرفة (السياق الوحيد المسموح بالاعتماد عليه):\n"+context:"لا يوجد سياق متاح بخصوص هذا السؤال. يجب أن ترد بالنص الحرفي المحدد أعلاه فقط واعرض التحويل لموظف."].join("\n");
+const model=genAI.getGenerativeModel({model:ad.model||"gemini-2.5-flash-lite",temperature:0.1,systemInstruction:sys});
+const chat=model.startChat({history});
+const res=await chat.sendMessage(text);
+const reply=res.response.text().trim()||NO_INFO;
+cd.messages=cd.messages||[];
+cd.messages.push({from:"visitor",text,at:Date.now()},{from:"ai",text:reply,at:Date.now()});
+cd.updatedAt=Date.now();
+if(cd.contactId){
+const cr=await admin.from("contacts").select("*").eq("id",cd.contactId).maybeSingle();
+if(cr.data){const cud:any=cr.data.data||{};const cl=classify(cd.messages,cd.status);
+cud.leadScore=cl.score;cud.class=cl.cls;cud.lastSeen=Date.now();
+cud.tags=[...new Set([...(cud.tags||[]),...cl.tags])].slice(0,12);
+await admin.from("contacts").update({data:cud}).eq("id",cr.data.id);}
+}
+if(conv)await admin.from("conversations").update({data:cd}).eq("id",conv.id);
+await admin.rpc("increment_ai_usage",{wsid:wsId});
+return json({reply,handoff:false,conversation_id:conv?.id||null});
+}catch(err){console.error(err);return json({error:"server",message:"عذرًا، حصل خطأ مؤقت. حاول مرة ثانية."},500);}
+});
+</script>
+<script type="text/plain" id="src-ingest">
+// supabase/functions/kb-ingest/index.ts
+import { createClient } from "npm:@supabase/supabase-js@2";
+import { GoogleGenerativeAI } from "npm:@google/generative-ai";
+const json=(b,s=200)=>new Response(JSON.stringify(b),{status:s,headers:{"Content-Type":"application/json","Access-Control-Allow-Origin":"*"}});
+function chunkText(text:string,size=800,overlap=100){const clean=text.replace(/\s+/g," ").trim();const out:string[]=[];for(let i=0;i<clean.length;i+=size-overlap){const c=clean.slice(i,i+size).trim();if(c.length>20)out.push(c);}return out;}
+Deno.serve(async(req)=>{
+if(req.method==="OPTIONS")return new Response("ok",{headers:{"Access-Control-Allow-Origin":"*","Access-Control-Allow-Headers":"*"}});
+try{
+const body=await req.json().catch(()=>({}));
+const doc_id=body.doc_id;
+if(!doc_id)return json({error:"bad_request",message:"طلب غير صالح."},400);
+const admin=createClient(Deno.env.get("SUPABASE_URL")!,Deno.env.get("SUPABASE_SERVICE_ROLE_KEY")!);
+if(body.delete===true){
+const d1=await admin.from("knowledge_chunks").delete().eq("doc_id",doc_id);
+if(d1.error)return json({error:"delete",message:"فشل حذف المقاطع: "+d1.error.message},500);
+const d2=await admin.from("knowledge_docs").delete().eq("id",doc_id);
+if(d2.error)return json({error:"delete",message:"فشل حذف المستند: "+d2.error.message},500);
+return json({ok:true,deleted:true});
+}
+const text=String(body.text||"").trim();
+if(!text)return json({error:"empty",message:"النص فارغ."},422);
+const dr=await admin.from("knowledge_docs").select("*").eq("id",doc_id).maybeSingle();
+const row:any=dr.data;const dd:any=(row&&row.data)||{};
+const wsId=body.workspace_id||(row?row.workspace_id:null);
+let agentId=body.agent_id||null;
+if(!agentId)agentId=dd.agentId||null;
+let targets:string[]=[];
+if(agentId)targets=[agentId];
+else{const ar=await admin.from("agents").select("id").eq("workspace_id",wsId);targets=(ar.data||[]).map((a:any)=>a.id);}
+if(!targets.length)return json({error:"no_agent",message:"لا يوجد Agent لربط المعرفة به. أنشئ Agent أولًا."},422);
+const chunks=chunkText(text).slice(0,400);
+const genAI=new GoogleGenerativeAI(Deno.env.get("GEMINI_API_KEY")!);
+const embModel=genAI.getGenerativeModel({model:"text-embedding-004"});
+await admin.from("knowledge_chunks").delete().eq("doc_id",doc_id);
+const rows:any[]=[];
+for(let i=0;i<chunks.length;i+=20){
+const batch=chunks.slice(i,i+20);
+const r=await embModel.batchEmbedContents(batch.map(c=>({content:c})));
+r.embeddings.forEach((e:any,j:number)=>{targets.forEach(tg=>rows.push({workspace_id:wsId,doc_id,content:batch[j],embedding:e.values,agent_id:tg}));});
+}
+const ins=await admin.from("knowledge_chunks").insert(rows);
+if(ins.error)return json({error:"insert",message:"فشل تخزين المقاطع: "+ins.error.message},500);
+if(row){dd.status="ready";dd.chunkCount=chunks.length;dd.lastSync=Date.now();dd.error="";
+await admin.from("knowledge_docs").update({data:dd}).eq("id",doc_id);}
+return json({ok:true,chunks:chunks.length});
+}catch(err){console.error("kb-ingest error",err);return json({error:"server",message:"فشل حفظ المعرفة: "+(err?.message||String(err))},500);}
+});
+</script>
+<script type="text/plain" id="src-kbproc">
+// supabase/functions/kb-process/index.ts
+import { createClient } from "npm:@supabase/supabase-js@2";
+import { GoogleGenerativeAI } from "npm:@google/generative-ai";
+import { extractText, getDocumentProxy } from "npm:unpdf";
+import mammoth from "npm:mammoth";
+import * as XLSX from "npm:xlsx";
+const json=(b,s=200)=>new Response(JSON.stringify(b),{status:s,headers:{"Content-Type":"application/json","Access-Control-Allow-Origin":"*"}});
+function chunkText(text:string,size=800,overlap=100){const clean=text.replace(/\s+/g," ").trim();const out:string[]=[];for(let i=0;i<clean.length;i+=size-overlap){const c=clean.slice(i,i+size).trim();if(c.length>20)out.push(c);}return out;}
+async function extractByType(name:string,buf:Uint8Array){
+const ext=(name.split(".").pop()||"").toLowerCase();
+try{
+if(ext==="pdf"){const pdf=await getDocumentProxy(buf.slice().buffer);const {text}=await extractText(pdf,{mergePages:true});return Array.isArray(text)?text.join("\n"):text;}
+if(ext==="docx")return (await mammoth.extractRawText({buffer:buf.slice().buffer})).value;
+if(ext==="csv"||ext==="txt"||ext==="md")return new TextDecoder("utf-8").decode(buf);
+if(ext==="xlsx"||ext==="xls"){const wb=XLSX.read(buf.slice().buffer,{type:"array"});let out="";for(const sn of wb.SheetNames)out+="\n["+sn+"]\n"+XLSX.utils.sheet_to_csv(wb.Sheets[sn]);return out;}
+}catch(e:any){throw new Error("فشل استخراج النص من الملف ("+ext+"): "+(e?.message||String(e)));}
+throw new Error("نوع الملف غير مدعوم: "+ext);
+}
+Deno.serve(async(req)=>{
+if(req.method==="OPTIONS")return new Response("ok",{headers:{"Access-Control-Allow-Origin":"*","Access-Control-Allow-Headers":"*"}});
+try{
+const {doc_id,path,agent_id}=await req.json().catch(()=>({}));
+if(!doc_id||!path)return json({error:"bad_request",message:"طلب غير صالح."},400);
+const admin=createClient(Deno.env.get("SUPABASE_URL")!,Deno.env.get("SUPABASE_SERVICE_ROLE_KEY")!);
+const {data:file,error:dlErr}=await admin.storage.from("kb-files").download(path);
+if(dlErr||!file)return json({error:"download",message:"تعذر قراءة الملف من التخزين: "+(dlErr?.message||"")},500);
+const buf=new Uint8Array(await file.arrayBuffer());
+const text=await extractByType(path.split("/").pop()||"file",buf);
+if(!text||!text.trim())return json({error:"empty",message:"الملف لا يحتوي نصًا قابلًا للاستخراج."},422);
+const dr=await admin.from("knowledge_docs").select("*").eq("id",doc_id).maybeSingle();
+const row:any=dr.data;const dd:any=(row&&row.data)||{};
+let agentId=agent_id||null;
+if(!agentId)agentId=dd.agentId||null;
+const wsId=row?row.workspace_id:null;
+let targets:string[]=[];
+if(agentId)targets=[agentId];
+else{const ar=await admin.from("agents").select("id").eq("workspace_id",wsId);targets=(ar.data||[]).map((a:any)=>a.id);}
+if(!targets.length)return json({error:"no_agent",message:"لا يوجد Agent لربط المعرفة به."},422);
+const chunks=chunkText(text).slice(0,400);
+const genAI=new GoogleGenerativeAI(Deno.env.get("GEMINI_API_KEY")!);
+const embModel=genAI.getGenerativeModel({model:"text-embedding-004"});
+await admin.from("knowledge_chunks").delete().eq("doc_id",doc_id);
+const rows:any[]=[];
+for(let i=0;i<chunks.length;i+=20){
+const batch=chunks.slice(i,i+20);
+const r=await embModel.batchEmbedContents(batch.map(c=>({content:c})));
+r.embeddings.forEach((e:any,j:number)=>{targets.forEach(tg=>rows.push({workspace_id:wsId,doc_id,content:batch[j],embedding:e.values,agent_id:tg}));});
+}
+const ins=await admin.from("knowledge_chunks").insert(rows);
+if(ins.error)return json({error:"insert",message:"فشل إنشاء التضمينات أو تخزين المقاطع: "+ins.error.message},500);
+if(row){dd.status="ready";dd.chunkCount=chunks.length;dd.lastSync=Date.now();dd.error="";
+await admin.from("knowledge_docs").update({data:dd}).eq("id",doc_id);}
+return json({ok:true,chunks:chunks.length,summary:"تمت المعالجة وتخزين التضمينات."});
+}catch(err){console.error("kb-process error",err);return json({error:"server",message:err?.message||"فشل في معالجة الملف."},500);}
+});
+</script>
+<script type="text/plain" id="src-crawl">
+// supabase/functions/kb-crawl/index.ts — زحف حتى 10 صفحات ضمن نفس النطاق
+import { createClient } from "npm:@supabase/supabase-js@2";
+import { GoogleGenerativeAI } from "npm:@google/generative-ai";
+import { parse } from "npm:node-html-parser";
+const json=(b,s=200)=>new Response(JSON.stringify(b),{status:s,headers:{"Content-Type":"application/json","Access-Control-Allow-Origin":"*"}});
+const MAX_PAGES=10;
+function chunkText(text:string,size=800,overlap=100){const clean=text.replace(/\s+/g," ").trim();const out:string[]=[];for(let i=0;i<clean.length;i+=size-overlap){const c=clean.slice(i,i+size).trim();if(c.length>20)out.push(c);}return out;}
+function extractPage(html:string){const root=parse(html);
+root.querySelectorAll("script,style,noscript,svg,iframe,nav,footer,form,button").forEach(n=>n.remove());
+const links=root.querySelectorAll("a[href]").map(a=>a.getAttribute("href")||"").filter(h=>h&&!h.startsWith("#")&&!h.startsWith("mailto:")&&!h.startsWith("tel:")&&!h.startsWith("javascript:"));
+const title=(root.querySelector("title")?.text||"").trim();
+const body=root.querySelector("main")||root.querySelector("body");
+return {text:((title?title+"\n":"")+(body?.text||"")).replace(/\s+/g," ").trim(),links};}
+Deno.serve(async(req)=>{
+if(req.method==="OPTIONS")return new Response("ok",{headers:{"Access-Control-Allow-Origin":"*","Access-Control-Allow-Headers":"*"}});
+try{
+const {url,doc_id,workspace_id,agent_id}=await req.json().catch(()=>({}));
+if(!url||!doc_id)return json({error:"bad_request",message:"طلب غير صالح."},400);
+if(!/^https?:\/\//i.test(url))return json({error:"bad_url",message:"الرابط يجب أن يبدأ بـ http أو https."},400);
+const admin=createClient(Deno.env.get("SUPABASE_URL")!,Deno.env.get("SUPABASE_SERVICE_ROLE_KEY")!);
+const origin=new URL(url).origin;
+const queue:string[]=[url];const visited=new Set<string>();const pages:string[]=[];
+while(queue.length&&visited.size<MAX_PAGES){
+const next=queue.shift()!;let u:URL;try{u=new URL(next,origin);}catch{continue;}
+const key=u.origin+u.pathname;
+if(u.origin!==origin||visited.has(key))continue;
+visited.add(key);
+try{const res=await fetch(u.toString(),{headers:{"User-Agent":"SocialBot/1.0"},redirect:"follow",signal:AbortSignal.timeout(15000)});
+if(!res.ok){continue;}
+const ct=res.headers.get("content-type")||"";
+if(!ct.includes("html"))continue;
+const {text,links}=extractPage(await res.text());
+if(text.length>40)pages.push("صفحة: "+u.pathname+"\n"+text.slice(0,20000));
+for(const l of links)queue.push(new URL(l,u.toString()).toString());
+}catch(fetchErr){continue;}
+}
+if(!pages.length)return json({error:"empty",message:"الموقع لا يحتوي نصًا كافيًا — قد يعتمد على JavaScript أو يمنع القراءة الآلية."},422);
+const dr=await admin.from("knowledge_docs").select("*").eq("id",doc_id).maybeSingle();
+const row:any=dr.data;const dd:any=(row&&row.data)||{};
+let agentId=agent_id||null;
+if(!agentId)agentId=dd.agentId||null;
+const wsId=workspace_id||(row?row.workspace_id:null);
+let targets:string[]=[];
+if(agentId)targets=[agentId];
+else{const ar=await admin.from("agents").select("id").eq("workspace_id",wsId);targets=(ar.data||[]).map((a:any)=>a.id);}
+if(!targets.length)return json({error:"no_agent",message:"لا يوجد Agent لربط المعرفة به."},422);
+const chunks=chunkText(pages.join("\n")).slice(0,600);
+const genAI=new GoogleGenerativeAI(Deno.env.get("GEMINI_API_KEY")!);
+const embModel=genAI.getGenerativeModel({model:"text-embedding-004"});
+await admin.from("knowledge_chunks").delete().eq("doc_id",doc_id);
+const rows:any[]=[];
+for(let i=0;i<chunks.length;i+=20){
+const batch=chunks.slice(i,i+20);
+const r=await embModel.batchEmbedContents(batch.map(c=>({content:c})));
+r.embeddings.forEach((e:any,j:number)=>{targets.forEach(tg=>rows.push({workspace_id:wsId,doc_id,content:batch[j],embedding:e.values,agent_id:tg}));});
+}
+const ins=await admin.from("knowledge_chunks").insert(rows);
+if(ins.error)return json({error:"insert",message:"فشل تخزين المقاطع: "+ins.error.message},500);
+if(row){dd.status="ready";dd.chunkCount=chunks.length;dd.lastSync=Date.now();dd.pages=visited.size;dd.error="";
+await admin.from("knowledge_docs").update({data:dd}).eq("id",doc_id);}
+return json({ok:true,chunks:chunks.length,pages:visited.size});
+}catch(err){console.error("kb-crawl error",err);return json({error:"server",message:"فشل الزحف: "+(err?.message||String(err))},500);}
+});
+</script>
+<script type="text/plain" id="src-widgetjs">
+/* widget.js — السمات: data-widget-id / data-token / data-api */
+(function(){
+var sc=document.currentScript||(function(){var all=document.querySelectorAll('script[data-widget-id]');return all[all.length-1];})();
+if(!sc)return;
+var WIDGET_ID=sc.getAttribute('data-widget-id');
+var TOKEN=sc.getAttribute('data-token');
+var API=(sc.getAttribute('data-api')||'').replace(/\/+$/,'');
+if(!WIDGET_ID||!TOKEN||!API)return;
+fetch(API+'/verify-widget',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({widget_id:WIDGET_ID,token:TOKEN})})
+.then(function(r){return r.json();})
+.then(function(cfg){/* بناء الواجهة من cfg.settings داخل Shadow DOM */})
+.catch(function(){});
+})();
+</script>
+<!-- ====== ترتيب التحميل مهم: utils قبل state، وapp.js دائمًا آخر ملف (يستدعي boot()) ====== -->
+<script src="js/core/utils.js"></script>
+<script src="js/core/state.js"></script>
+<script src="js/core/supabase.js"></script>
+<script src="js/core/router.js"></script>
+<script src="js/auth/auth.js"></script>
+<script src="js/landing/landing.js"></script>
+<script src="js/onboarding/onboarding.js"></script>
+<script src="js/dashboard/dashboard.js"></script>
+<script src="js/agents/agents.js"></script>
+<script src="js/knowledge/knowledge.js"></script>
+<script src="js/knowledge/pdf.js"></script>
+<script src="js/knowledge/website.js"></script>
+<script src="js/knowledge/manual.js"></script>
+<script src="js/channels/channels.js"></script>
+<script src="js/conversations/conversations.js"></script>
+<script src="js/contacts/contacts.js"></script>
+<script src="js/widgets/widgets.js"></script>
+<script src="js/analytics/analytics.js"></script>
+<script src="js/billing/billing.js"></script>
+<script src="js/settings/settings.js"></script>
+<script src="js/core/app.js"></script>
+</body>
+</html>

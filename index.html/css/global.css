@@ -1,0 +1,47 @@
+/* global.css — الأنماط العامة المشتركة عبر كل صفحات الموقع (خطوط، أزرار، حقول، سكرول، أنيميشن).
+   ملاحظة مهمة: الموقع مبني على Tailwind CDN (utility classes) بشكل شبه كامل — معظم التصميم
+   يتم عبر الـ classes مباشرة داخل HTML/JS (مثل: rounded-2xl, flex, gap-3...) وليس عبر ملفات CSS منفصلة.
+   لهذا السبب ملفات auth.css / dashboard.css / agents.css ... إلخ لا تحتوي على قواعد فعلية حاليًا —
+   لا يوجد تصميم خاص بكل صفحة مفصول عن الآخر في الكود الأصلي. أبقيتها كملفات فارغة (stub) مع تعليق
+   توضيحي حتى تتوافق مع الهيكلة المطلوبة، وتقدر تضيف فيها تخصيصات مستقبلية لكل قسم. */
+
+html{scroll-behavior:smooth}
+body{background:#12151a;color:#f5f6f7;font-family:'IBM Plex Sans Arabic',Cairo,sans-serif}
+::-webkit-scrollbar{width:8px;height:8px}::-webkit-scrollbar-thumb{background:#2b323b;border-radius:8px}
+.glass{background:rgba(26,30,36,.6);backdrop-filter:blur(14px);border:1px solid rgba(255,255,255,.06)}
+.fadeUp{animation:fadeUp .5s ease both}
+@keyframes fadeUp{from{opacity:0;transform:translateY(14px)}to{opacity:1;transform:none}}
+.typing span{display:inline-block;width:6px;height:6px;border-radius:9999px;background:currentColor;animation:tp 1s infinite}
+.typing span:nth-child(2){animation-delay:.18s}.typing span:nth-child(3){animation-delay:.36s}
+@keyframes tp{0%,60%,100%{transform:translateY(0);opacity:.4}30%{transform:translateY(-4px);opacity:1}}
+.pulse-dot{position:relative}.pulse-dot::after{content:'';position:absolute;inset:-4px;border-radius:9999px;border:2px solid #22cdc8;animation:pl 1.6s infinite}
+@keyframes pl{0%{transform:scale(.6);opacity:.9}100%{transform:scale(1.4);opacity:0}}
+.bar{transition:height .6s cubic-bezier(.2,.8,.2,1)}
+input[type=range]{accent-color:#0ABAB5}
+input[type=color]{width:42px;height:34px;border:1px solid #2b323b;border-radius:8px;background:#1a1e24;padding:2px;cursor:pointer}
+.chat-scroll{scrollbar-width:thin}
+.msg-in{animation:fadeUp .3s ease both}
+details.faq summary::-webkit-details-marker{display:none}
+.grid-bg{background-image:linear-gradient(rgba(255,255,255,.04) 1px,transparent 1px),linear-gradient(90deg,rgba(255,255,255,.04) 1px,transparent 1px);background-size:44px 44px}
+.switch{position:relative;width:40px;height:22px;border-radius:9999px;background:#414a56;transition:.2s;flex:none;border:none;cursor:pointer}
+.switch::after{content:'';position:absolute;top:3px;right:3px;width:16px;height:16px;border-radius:9999px;background:#fff;transition:.2s}
+.switch.on{background:#0ABAB5}.switch.on::after{transform:translateX(-18px)}
+.ltr{direction:ltr}
+.lbl2{display:block;font-size:12px;color:#aeb6bf}.lbl2 .inp-s{margin-top:6px}
+.btn-primary{display:inline-flex;align-items:center;justify-content:center;gap:8px;background:#0ABAB5;color:#0b2a29;font-weight:700;border-radius:12px;padding:10px 20px;font-size:14px;transition:.2s;border:none;cursor:pointer}.btn-primary:hover{background:#22cdc8}.btn-primary:disabled{opacity:.5;cursor:not-allowed}
+.btn-ghost{display:inline-flex;align-items:center;justify-content:center;gap:8px;background:#22272f;border:1px solid #2b323b;color:#d3d7dc;border-radius:12px;padding:10px 20px;font-size:14px;transition:.2s;cursor:pointer}.btn-ghost:hover{border-color:#0ABAB5;color:#fff}
+.inp-s{width:100%;background:#1a1e24;border:1px solid #2b323b;border-radius:10px;padding:9px 12px;color:#f5f6f7;outline:none;font-size:13px;transition:.2s;box-sizing:border-box}.inp-s:focus{border-color:#0ABAB5}
+.sec-title{font-family:Cairo;font-weight:800;font-size:2.1rem;text-align:center}
+.sec-sub{color:#8a94a0;text-align:center;margin-top:10px}
+.line-clamp-2{display:-webkit-box;-webkit-line-clamp:2;-webkit-box-orient:vertical;overflow:hidden}
+.lbl{display:block;font-size:13px;color:#aeb6bf}
+.inp{width:100%;margin-top:6px;background:#1a1e24;border:1px solid #2b323b;border-radius:12px;padding:11px 14px;color:#f5f6f7;outline:none;transition:.2s;box-sizing:border-box}
+.inp:focus{border-color:#0ABAB5;box-shadow:0 0 0 3px rgba(10,186,181,.15)}
+pre.codebox{direction:ltr;text-align:left;font-family:ui-monospace,Menlo,monospace;font-size:11px;line-height:1.7;white-space:pre;overflow:auto;background:#0b0e12;border:1px solid #2b323b;border-radius:12px;padding:16px;color:#8aeae6;max-height:380px}
+.eng-tab{padding:6px 12px;border-radius:10px;font-size:12px;border:1px solid #2b323b;background:#22272f;color:#aeb6bf;cursor:pointer;transition:.2s}
+.eng-tab.on{background:rgba(10,186,181,.12);border-color:rgba(10,186,181,.5);color:#4fdcd7}
+.btn-primary,.btn-ghost,.glass,.switch{box-sizing:border-box}
+.ob-next-active{box-shadow:0 4px 14px rgba(10,186,181,0.4)}
+.ob-spin{display:inline-block;width:12px;height:12px;border:2px solid rgba(10,186,181,.3);border-top-color:#0ABAB5;border-radius:9999px;animation:obsp .8s linear infinite;vertical-align:middle}
+@keyframes obsp{to{transform:rotate(360deg)}}
+</style>

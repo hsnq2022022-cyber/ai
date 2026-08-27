@@ -1,4 +1,0 @@
--- Onboarding: لا يلزم جدول جديد. حالة المعالج تُدار ضمن إعدادات مساحة العمل
--- وتُحفظ تلقائيًا عبر save() مع استئناف تلقائي عند العودة.
--- (اختياري) للمزامنة على الخادم:
--- alter table public.workspaces add column if not exists onboarded boolean default false;
